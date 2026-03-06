@@ -80,8 +80,16 @@ class WCAIG_Admin_Settings {
 				'desc_tip' => true,
 			),
 			array(
+				'title'    => __( 'Webhook Secret', 'wc-ai-image-gen' ),
+				'desc'     => __( 'Shared secret sent in x-webhook-secret header. Must match PiAPI config.', 'wc-ai-image-gen' ),
+				'id'       => 'wcaig_webhook_secret',
+				'type'     => 'password',
+				'default'  => '',
+				'desc_tip' => true,
+			),
+			array(
 				'title'    => __( 'Poll Interval (sec)', 'wc-ai-image-gen' ),
-				'desc'     => __( 'Seconds between status polls.', 'wc-ai-image-gen' ),
+				'desc'     => __( 'Seconds between frontend status polls (browser → your server).', 'wc-ai-image-gen' ),
 				'id'       => 'wcaig_poll_interval',
 				'type'     => 'number',
 				'default'  => 5,
@@ -90,7 +98,7 @@ class WCAIG_Admin_Settings {
 			),
 			array(
 				'title'    => __( 'Max Poll Attempts', 'wc-ai-image-gen' ),
-				'desc'     => __( 'Maximum number of status polls before timeout.', 'wc-ai-image-gen' ),
+				'desc'     => __( 'Maximum number of frontend polls before giving up.', 'wc-ai-image-gen' ),
 				'id'       => 'wcaig_max_poll_attempts',
 				'type'     => 'number',
 				'default'  => 60,

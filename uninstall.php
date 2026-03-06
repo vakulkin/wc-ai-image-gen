@@ -28,6 +28,7 @@ $wpdb->query( "DROP TABLE IF EXISTS {$wpdb->prefix}wcaig_usage_log" );
 
 $option_keys = array(
 	'wcaig_api_key',
+	'wcaig_webhook_secret',
 	'wcaig_model',
 	'wcaig_task_type',
 	'wcaig_poll_interval',

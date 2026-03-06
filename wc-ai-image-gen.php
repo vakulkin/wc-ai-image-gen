@@ -109,6 +109,7 @@ final class WC_AI_Image_Gen {
 			'class-prompt-builder.php',
 			'class-api-client.php',
 			'class-usage-tracker.php',
+			'class-webhook-handler.php',
 			'class-ajax-handler.php',
 			'class-admin-metabox.php',
 		);
@@ -126,6 +127,7 @@ final class WC_AI_Image_Gen {
 		WCAIG_Admin_Settings::instance();
 		WCAIG_ACF_Fields::instance();
 		WCAIG_Usage_Tracker::instance();
+		WCAIG_Webhook_Handler::instance();
 		WCAIG_Ajax_Handler::instance();
 		WCAIG_Admin_Metabox::instance();
 
@@ -190,10 +192,12 @@ final class WC_AI_Image_Gen {
 		$ref_thumbs = $this->collect_ref_thumbs( $post->ID );
 
 		wp_localize_script( 'wcaig-frontend', 'wcaig', array(
-			'ajax_url'   => admin_url( 'admin-ajax.php' ),
-			'nonce'      => wp_create_nonce( 'wcaig_nonce' ),
-			'product_id' => $post->ID,
-			'ref_thumbs' => $ref_thumbs,
+			'ajax_url'           => admin_url( 'admin-ajax.php' ),
+			'nonce'              => wp_create_nonce( 'wcaig_nonce' ),
+			'product_id'         => $post->ID,
+			'ref_thumbs'         => $ref_thumbs,
+			'poll_interval'      => (int) get_option( 'wcaig_poll_interval', 5 ),
+			'max_poll_attempts'  => (int) get_option( 'wcaig_max_poll_attempts', 60 ),
 		) );
 	}
 

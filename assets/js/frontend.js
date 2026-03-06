@@ -1,7 +1,8 @@
 /**
  * WC AI Image Generator — Frontend JS
  *
- * Attribute listener, debounce, abort, AJAX calls, orbit loader, SweetAlert2 modal.
+ * Attribute listener, debounce, abort, AJAX calls,
+ * client-side polling (webhook-based backend), orbit loader, SweetAlert2 modal.
  */
 (function ($) {
     'use strict';
@@ -11,19 +12,29 @@
     }
 
     /* ================================================================
+     *  Config (from wp_localize_script)
+     * ================================================================ */
+
+    var POLL_INTERVAL     = (wcaig.poll_interval || 5) * 1000;   // ms
+    var MAX_POLL_ATTEMPTS = wcaig.max_poll_attempts || 60;
+
+    /* ================================================================
      *  State
      * ================================================================ */
 
-    var currentXHR = null;       // In-flight AJAX request (abortable).
-    var debounceTimer = null;    // Debounce timer handle.
-    var isGenerating = false;    // Prevents duplicate triggers.
-    var orbitActive = false;     // Orbit loader currently showing.
+    var currentXHR     = null;   // In-flight AJAX (check / generate).
+    var pollTimer      = null;   // setInterval handle for polling.
+    var pollCount      = 0;      // Current poll attempt.
+    var debounceTimer  = null;
+    var isGenerating   = false;
+    var orbitActive    = false;
+    var currentAttrs   = null;   // Attributes being generated (for dedup).
 
     /* ================================================================
      *  Selectors
      * ================================================================ */
 
-    var $gallery = $('.woocommerce-product-gallery, .product-images, .product-gallery').first();
+    var $gallery        = $('.woocommerce-product-gallery, .product-images, .product-gallery').first();
     var $variationsForm = $('form.variations_form');
 
     /* ================================================================
@@ -32,27 +43,24 @@
 
     $variationsForm.on('change', 'select, input[type="radio"]', function () {
         clearTimeout(debounceTimer);
-        abortCurrent();
+        abortAll();
 
         debounceTimer = setTimeout(function () {
             onAttributesChanged();
         }, 300);
     });
 
-    // Also listen to WooCommerce's own variation events.
     $variationsForm.on('woocommerce_variation_select_change', function () {
         clearTimeout(debounceTimer);
-        abortCurrent();
+        abortAll();
 
         debounceTimer = setTimeout(function () {
             onAttributesChanged();
         }, 300);
     });
 
-    // Reset / clear events.
     $variationsForm.on('reset_data', function () {
-        abortCurrent();
-        hideOrbitLoader();
+        abortAll();
     });
 
     /* ================================================================
@@ -62,15 +70,17 @@
     function onAttributesChanged() {
         var attributes = getSelectedAttributes();
         if (!attributes) {
-            return; // Not all dropdowns selected.
+            return;
         }
 
-        // Step 1: Check cache.
         checkCache(attributes);
     }
 
+    /**
+     * Step 1: Check cache.
+     */
     function checkCache(attributes) {
-        abortCurrent();
+        abortAll();
 
         currentXHR = $.ajax({
             url: wcaig.ajax_url,
@@ -89,13 +99,11 @@
                 }
 
                 if (response.data.hit) {
-                    // Cache hit — show modal immediately.
                     showResultModal(response.data.image_url);
                 } else {
-                    // Cache miss — start generation.
                     var thumbs = response.data.ref_thumbs || wcaig.ref_thumbs || [];
                     showOrbitLoader(thumbs);
-                    generateImage(attributes);
+                    requestGeneration(attributes, thumbs);
                 }
             },
             error: function (xhr, status) {
@@ -107,11 +115,15 @@
         });
     }
 
-    function generateImage(attributes) {
+    /**
+     * Step 2: Request generation (returns immediately with task_id or cached result).
+     */
+    function requestGeneration(attributes, thumbs) {
         if (isGenerating) {
             return;
         }
         isGenerating = true;
+        currentAttrs = attributes;
 
         currentXHR = $.ajax({
             url: wcaig.ajax_url,
@@ -122,60 +134,141 @@
                 product_id: wcaig.product_id,
                 attributes: attributes
             },
-            timeout: 0, // No client-side timeout — server manages polling.
             success: function (response) {
                 currentXHR = null;
+
+                if (!response.success) {
+                    isGenerating = false;
+                    hideOrbitLoader();
+                    showErrorModal(response.data || 'Generation request failed.');
+                    return;
+                }
+
+                var data = response.data;
+
+                if (data.status === 'completed' && data.image_url) {
+                    // Already cached (race condition guard on server hit).
+                    isGenerating = false;
+                    hideOrbitLoader();
+                    showResultModal(data.image_url);
+                    return;
+                }
+
+                if (data.status === 'pending' && data.task_id) {
+                    // Task submitted — start polling our server.
+                    startPolling(attributes, thumbs);
+                    return;
+                }
+
+                // Unexpected shape.
                 isGenerating = false;
                 hideOrbitLoader();
-
-                if (response.success && response.data.image_url) {
-                    showResultModal(response.data.image_url, response.data.prompt || '');
-                } else {
-                    showErrorModal(response.data || 'Generation failed.');
-                }
+                showErrorModal('Unexpected response from server.');
             },
             error: function (xhr, status, error) {
                 currentXHR = null;
                 isGenerating = false;
-                hideOrbitLoader();
 
                 if (status === 'abort') {
                     return;
                 }
 
-                if (status === 'timeout') {
-                    showErrorModal('Image generation timed out. Please try again.');
-                } else {
-                    showErrorModal('An error occurred: ' + (error || status));
-                }
+                hideOrbitLoader();
+                showErrorModal('Request error: ' + (error || status));
             }
         });
+    }
+
+    /**
+     * Step 3: Poll wcaig_poll until completed / failed / timeout.
+     */
+    function startPolling(attributes, thumbs) {
+        stopPolling();
+        pollCount = 0;
+
+        pollTimer = setInterval(function () {
+            pollCount++;
+
+            if (pollCount > MAX_POLL_ATTEMPTS) {
+                stopPolling();
+                isGenerating = false;
+                hideOrbitLoader();
+                showErrorModal('Image generation timed out. Please try again.');
+                return;
+            }
+
+            $.ajax({
+                url: wcaig.ajax_url,
+                type: 'POST',
+                data: {
+                    action: 'wcaig_poll',
+                    nonce: wcaig.nonce,
+                    product_id: wcaig.product_id,
+                    attributes: attributes
+                },
+                success: function (response) {
+                    if (!response.success) {
+                        return; // Keep polling.
+                    }
+
+                    var data = response.data;
+
+                    if (data.status === 'completed' && data.image_url) {
+                        stopPolling();
+                        isGenerating = false;
+                        hideOrbitLoader();
+                        showResultModal(data.image_url);
+                        return;
+                    }
+
+                    if (data.status === 'failed') {
+                        stopPolling();
+                        isGenerating = false;
+                        hideOrbitLoader();
+                        showErrorModal(data.error || 'Generation failed.');
+                        return;
+                    }
+
+                    // status === 'processing' — keep polling.
+                },
+                error: function (xhr, status) {
+                    // Network hiccup — keep polling, don't abort.
+                    if (status === 'abort') {
+                        stopPolling();
+                    }
+                }
+            });
+        }, POLL_INTERVAL);
+    }
+
+    function stopPolling() {
+        if (pollTimer) {
+            clearInterval(pollTimer);
+            pollTimer = null;
+        }
+        pollCount = 0;
     }
 
     /* ================================================================
      *  Attribute Helpers
      * ================================================================ */
 
-    /**
-     * Collect all selected attribute values. Returns null if any dropdown is empty.
-     */
     function getSelectedAttributes() {
         var attrs = {};
         var allSelected = true;
 
         $variationsForm.find('select[name^="attribute_"]').each(function () {
             var name = $(this).attr('name');
-            var val = $(this).val();
+            var val  = $(this).val();
 
             if (!val || val === '') {
                 allSelected = false;
-                return false; // break
+                return false;
             }
 
             attrs[name] = val;
         });
 
-        // Also check radio-based attribute selectors (some themes use radios).
         $variationsForm.find('input[type="radio"][name^="attribute_"]:checked').each(function () {
             attrs[$(this).attr('name')] = $(this).val();
         });
@@ -184,7 +277,6 @@
             return null;
         }
 
-        // Verify we actually have attributes.
         if ($.isEmptyObject(attrs)) {
             return null;
         }
@@ -196,12 +288,14 @@
      *  Abort
      * ================================================================ */
 
-    function abortCurrent() {
+    function abortAll() {
         if (currentXHR) {
             currentXHR.abort();
             currentXHR = null;
         }
+        stopPolling();
         isGenerating = false;
+        currentAttrs = null;
         hideOrbitLoader();
     }
 
@@ -239,7 +333,6 @@
         $gallery.css('position', 'relative');
         $gallery.append($loader);
 
-        // Trigger animation.
         requestAnimationFrame(function () {
             $loader.addClass('wcaig-orbit-active');
         });

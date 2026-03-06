@@ -1,6 +1,15 @@
 <?php
 /**
- * AJAX Handler — validates requests, orchestrates check → generate → cache → respond.
+ * AJAX Handler — validates requests, orchestrates async generation via webhook.
+ *
+ * Flow:
+ *   1. wcaig_check     → cache lookup (same as before)
+ *   2. wcaig_generate  → creates PIAPI task with webhook, returns task_id immediately
+ *   3. wcaig_poll      → frontend polls this to check if webhook has delivered the result
+ *
+ * Concurrent-request dedup:
+ *   If a lock transient already exists for this product+hash, the existing task_id is
+ *   returned so the new client can poll the same in-flight task.
  */
 
 defined( 'ABSPATH' ) || exit;
@@ -24,6 +33,9 @@ class WCAIG_Ajax_Handler {
 
 		add_action( 'wp_ajax_wcaig_generate', array( $this, 'handle_generate' ) );
 		add_action( 'wp_ajax_nopriv_wcaig_generate', array( $this, 'handle_generate' ) );
+
+		add_action( 'wp_ajax_wcaig_poll', array( $this, 'handle_poll' ) );
+		add_action( 'wp_ajax_nopriv_wcaig_poll', array( $this, 'handle_poll' ) );
 	}
 
 	/* ------------------------------------------------------------------
@@ -67,7 +79,7 @@ class WCAIG_Ajax_Handler {
 	}
 
 	/* ------------------------------------------------------------------
-	 *  Generate
+	 *  Generate (async — returns task_id immediately)
 	 * ----------------------------------------------------------------*/
 
 	public function handle_generate(): void {
@@ -91,61 +103,121 @@ class WCAIG_Ajax_Handler {
 		$existing = $cache->find( $product_id, $base_image_id, $attributes );
 		if ( $existing ) {
 			wp_send_json_success( array(
+				'status'    => 'completed',
 				'image_url' => wp_get_attachment_url( $existing ),
 			) );
 		}
 
-		// Rate limit: transient lock.
+		// Compute hash for lock key.
 		$hash     = $cache->compute_hash( $product_id, $base_image_id, $attributes );
 		$lock_key = 'wcaig_generating_' . $product_id . '_' . $hash;
 
-		if ( get_transient( $lock_key ) ) {
-			wp_send_json_error( 'Generation already in progress for this combination.' );
+		// Dedup: if already in-flight, return the existing task_id for polling.
+		$existing_task_id = get_transient( $lock_key );
+		if ( $existing_task_id && is_string( $existing_task_id ) ) {
+			WC_AI_Image_Gen::log( "Generate: dedup — returning existing task {$existing_task_id} for hash {$hash}." );
+			wp_send_json_success( array(
+				'status'  => 'pending',
+				'task_id' => $existing_task_id,
+			) );
 		}
 
-		set_transient( $lock_key, true, 120 );
-
 		// Build prompt.
-		$builder = new WCAIG_Prompt_Builder();
+		$builder     = new WCAIG_Prompt_Builder();
 		$prompt_data = $builder->build( $product_id, $base_image_id, $attributes );
 
 		if ( empty( $prompt_data['prompt'] ) || empty( $prompt_data['image_urls'] ) ) {
-			delete_transient( $lock_key );
 			wp_send_json_error( 'Failed to build prompt.' );
 		}
 
-		// Call PIAPI.
+		// Create task at PIAPI (with webhook config — returns immediately).
 		$api    = new WCAIG_API_Client();
-		$result = $api->generate( $prompt_data['prompt'], $prompt_data['image_urls'] );
+		$result = $api->create_task( $prompt_data['prompt'], $prompt_data['image_urls'] );
 
 		if ( ! $result['success'] ) {
-			delete_transient( $lock_key );
-			wp_send_json_error( $result['error'] ?? 'API generation failed.' );
+			wp_send_json_error( $result['error'] ?? 'API task creation failed.' );
 		}
 
-		// Sideload image.
-		$attachment_id = $api->sideload_image( $result['image_url'], $hash, $product_id );
+		$task_id = $result['task_id'];
 
-		if ( is_wp_error( $attachment_id ) ) {
-			delete_transient( $lock_key );
-			wp_send_json_error( 'Failed to save image: ' . $attachment_id->get_error_message() );
-		}
+		// Store lock transient with task_id (so concurrent requests can dedup).
+		// TTL = 1 hour — generous; webhook cleanup will delete it earlier.
+		set_transient( $lock_key, $task_id, 3600 );
 
-		// Store in cache.
-		$cache->store( $product_id, $base_image_id, $attributes, $attachment_id, $prompt_data['prompt'] );
+		// Store task metadata so the webhook handler knows what to do.
+		$meta_key = 'wcaig_task_' . $task_id;
+		set_transient( $meta_key, array(
+			'product_id'    => $product_id,
+			'base_image_id' => $base_image_id,
+			'attributes'    => $attributes,
+			'hash'          => $hash,
+			'prompt_text'   => $prompt_data['prompt'],
+		), 3600 );
 
-		// Log usage.
-		WCAIG_Usage_Tracker::instance()->log_usage(
-			$product_id,
-			$result['task_id'] ?? '',
-			get_option( 'wcaig_model', 'gemini' )
-		);
+		WC_AI_Image_Gen::log( "Generate: created task {$task_id} for product {$product_id}, hash={$hash}." );
 
-		delete_transient( $lock_key );
-
+		// Return immediately — frontend will poll wcaig_poll.
 		wp_send_json_success( array(
-			'image_url'  => wp_get_attachment_url( $attachment_id ),
-			'prompt'     => $prompt_data['prompt'],
+			'status'  => 'pending',
+			'task_id' => $task_id,
+		) );
+	}
+
+	/* ------------------------------------------------------------------
+	 *  Poll (frontend checks if webhook has delivered the result)
+	 * ----------------------------------------------------------------*/
+
+	public function handle_poll(): void {
+		check_ajax_referer( 'wcaig_nonce', 'nonce' );
+
+		$product_id = $this->validate_product();
+		if ( is_wp_error( $product_id ) ) {
+			wp_send_json_error( $product_id->get_error_message() );
+		}
+
+		$attributes    = $this->sanitize_attributes();
+		$base_image_id = (int) get_post_thumbnail_id( $product_id );
+
+		if ( ! $base_image_id ) {
+			wp_send_json_error( 'Product has no featured image.' );
+		}
+
+		$cache = WCAIG_Image_Cache::instance();
+		$hash  = $cache->compute_hash( $product_id, $base_image_id, $attributes );
+
+		// 1. Check if the image is now in cache (webhook completed successfully).
+		$attachment_id = $cache->find( $product_id, $base_image_id, $attributes );
+		if ( $attachment_id ) {
+			wp_send_json_success( array(
+				'status'    => 'completed',
+				'image_url' => wp_get_attachment_url( $attachment_id ),
+			) );
+		}
+
+		// 2. Check if the webhook reported an error.
+		$error_key = 'wcaig_error_' . $product_id . '_' . $hash;
+		$error_msg = get_transient( $error_key );
+		if ( $error_msg ) {
+			delete_transient( $error_key );
+			wp_send_json_success( array(
+				'status' => 'failed',
+				'error'  => $error_msg,
+			) );
+		}
+
+		// 3. Check if the lock is still active (task still in-flight).
+		$lock_key = 'wcaig_generating_' . $product_id . '_' . $hash;
+		$lock_val = get_transient( $lock_key );
+		if ( $lock_val ) {
+			wp_send_json_success( array(
+				'status' => 'processing',
+			) );
+		}
+
+		// 4. Lock gone, no cache, no error — something unexpected happened.
+		wp_send_json_success( array(
+			'status' => 'failed',
+			'error'  => 'Generation status unknown. The task may have expired. Please try again.',
 		) );
 	}
 
