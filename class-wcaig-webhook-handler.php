@@ -44,17 +44,18 @@ class WCAIG_Webhook_Handler
      */
     public function verify_webhook_secret(WP_REST_Request $request): bool
     {
-        $secret = $request->get_header('x-webhook-secret');
-        if (empty($secret)) {
-            return false;
-        }
-
         $expected = '';
         if (function_exists('get_field')) {
             $expected = get_field('wcaig_webhook_secret', 'option');
         }
 
-        if (empty($expected) || $secret !== $expected) {
+        // If no secret is configured, allow the webhook through.
+        if (empty($expected)) {
+            return true;
+        }
+
+        $secret = $request->get_header('x-webhook-secret');
+        if (empty($secret) || $secret !== $expected) {
             return false;
         }
 
@@ -97,7 +98,7 @@ class WCAIG_Webhook_Handler
         }
 
         if ($status === 'failed') {
-            return $this->handle_failed($post);
+            return $this->handle_failed($post, $params);
         }
 
         WCAIG_Logger::instance()->warning("Webhook: unknown status '{$status}' for task={$task_id}");
@@ -159,8 +160,30 @@ class WCAIG_Webhook_Handler
     /**
      * Handle failed status.
      */
-    private function handle_failed(WP_Post $post): WP_REST_Response
+    private function handle_failed(WP_Post $post, array $params = []): WP_REST_Response
     {
+        // Check if this is a rate-limit failure — don't burn retries.
+        if ($this->is_rate_limit_failure($params)) {
+            wp_update_post([
+                'ID'          => $post->ID,
+                'post_status' => 'draft',
+            ]);
+            update_field('wcaig_task_id', '', $post->ID);
+
+            // Set cooldown transient so the worker backs off.
+            $cooldown = 120;
+            if (function_exists('get_field')) {
+                $setting = get_field('wcaig_rate_limit_cooldown', 'option');
+                if (is_numeric($setting) && (int) $setting > 0) {
+                    $cooldown = (int) $setting;
+                }
+            }
+            set_transient('wcaig_rate_limit_cooldown', time(), $cooldown);
+
+            WCAIG_Logger::instance()->warning("Webhook: rate-limited for variation {$post->ID}, reset to draft without burning retry (cooldown {$cooldown}s).");
+            return new WP_REST_Response([ 'ok' => true ], 200);
+        }
+
         $retry_count = (int) get_field('wcaig_retry_count', $post->ID);
         $retry_count++;
 
@@ -219,6 +242,33 @@ class WCAIG_Webhook_Handler
     }
 
     /**
+     * Check if PIAPI webhook payload indicates a rate-limit failure.
+     */
+    private function is_rate_limit_failure(array $params): bool
+    {
+        // Check logs array.
+        $logs = $params['logs'] ?? [];
+        foreach ($logs as $log) {
+            if (is_string($log) && stripos($log, 'too many requests') !== false) {
+                return true;
+            }
+        }
+
+        // Check error message.
+        $error_msg = $params['error']['message'] ?? '';
+        if (stripos($error_msg, 'too many requests') !== false) {
+            return true;
+        }
+
+        $raw_msg = $params['error']['raw_message'] ?? '';
+        if (stripos($raw_msg, 'too many requests') !== false) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
      * Extract image URL from PIAPI response (deep search).
      */
     private function extract_image_url(array $params): string
@@ -226,6 +276,11 @@ class WCAIG_Webhook_Handler
         // Direct output.image_url
         if (! empty($params['output']['image_url'])) {
             return $params['output']['image_url'];
+        }
+
+        // output.image_urls[0] (PIAPI Gemini format)
+        if (! empty($params['output']['image_urls'][0])) {
+            return (string) $params['output']['image_urls'][0];
         }
 
         // output.images[0]
@@ -242,6 +297,11 @@ class WCAIG_Webhook_Handler
         // data.output.image_url
         if (! empty($params['data']['output']['image_url'])) {
             return $params['data']['output']['image_url'];
+        }
+
+        // data.output.image_urls[0]
+        if (! empty($params['data']['output']['image_urls'][0])) {
+            return (string) $params['data']['output']['image_urls'][0];
         }
 
         return '';

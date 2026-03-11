@@ -108,7 +108,13 @@ class WCAIG_Worker
             if ($status === 'completed') {
                 $this->handle_poll_completed($post, $task_data);
             } elseif ($status === 'failed') {
-                $this->handle_poll_failed($post, $task_id);
+                $this->handle_poll_failed($post, $task_id, $task_data);
+
+                // If rate-limited, stop polling remaining tasks.
+                if ($this->is_rate_limited()) {
+                    WCAIG_Logger::instance()->info('Worker poll: rate-limit detected, stopping poll cycle.');
+                    break;
+                }
             }
             // 'processing' / 'pending' — do nothing, wait for next cycle.
         }
@@ -163,8 +169,22 @@ class WCAIG_Worker
     /**
      * Handle a failed task discovered by polling.
      */
-    private function handle_poll_failed(WP_Post $post, string $task_id): void
+    private function handle_poll_failed(WP_Post $post, string $task_id, array $task_data = []): void
     {
+        // Check if it's a rate-limit failure ("too many requests" in PIAPI logs).
+        if ($this->is_rate_limit_failure($task_data)) {
+            $this->set_rate_limit_cooldown();
+
+            // Reset to draft without burning a retry — this was not our fault.
+            wp_update_post([
+                'ID'          => $post->ID,
+                'post_status' => 'draft',
+            ]);
+            update_field('wcaig_task_id', '', $post->ID);
+            WCAIG_Logger::instance()->warning("Worker poll: rate-limited for variation {$post->ID} (task={$task_id}), reset to draft without burning retry.");
+            return;
+        }
+
         $max_retries = $this->get_option('wcaig_retry_count', 3);
         $retry_count = (int) get_field('wcaig_retry_count', $post->ID);
         $retry_count++;
@@ -188,6 +208,51 @@ class WCAIG_Worker
     }
 
     /**
+     * Check if PIAPI task data indicates a rate-limit failure.
+     */
+    private function is_rate_limit_failure(array $task_data): bool
+    {
+        // Check logs array for "too many requests".
+        $logs = $task_data['logs'] ?? [];
+        foreach ($logs as $log) {
+            if (is_string($log) && stripos($log, 'too many requests') !== false) {
+                return true;
+            }
+        }
+
+        // Check error message.
+        $error_msg = $task_data['error']['message'] ?? '';
+        if (stripos($error_msg, 'too many requests') !== false) {
+            return true;
+        }
+
+        $raw_msg = $task_data['error']['raw_message'] ?? '';
+        if (stripos($raw_msg, 'too many requests') !== false) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Set a rate-limit cooldown transient to pause queue processing.
+     */
+    private function set_rate_limit_cooldown(): void
+    {
+        $cooldown_seconds = (int) $this->get_option('wcaig_rate_limit_cooldown', 120);
+        set_transient('wcaig_rate_limit_cooldown', time(), $cooldown_seconds);
+        WCAIG_Logger::instance()->info("Worker: rate-limit cooldown set for {$cooldown_seconds}s.");
+    }
+
+    /**
+     * Check if rate-limit cooldown is active.
+     */
+    private function is_rate_limited(): bool
+    {
+        return (bool) get_transient('wcaig_rate_limit_cooldown');
+    }
+
+    /**
      * Extract image URL from PIAPI task data.
      */
     private function extract_image_url_from_task(array $data): string
@@ -195,6 +260,11 @@ class WCAIG_Worker
         // output.image_url
         if (! empty($data['output']['image_url'])) {
             return $data['output']['image_url'];
+        }
+
+        // output.image_urls[0] (PIAPI Gemini format)
+        if (! empty($data['output']['image_urls'][0])) {
+            return (string) $data['output']['image_urls'][0];
         }
 
         // output.images[0]
@@ -206,6 +276,11 @@ class WCAIG_Worker
         // result.image_url
         if (! empty($data['result']['image_url'])) {
             return $data['result']['image_url'];
+        }
+
+        // result.image_urls[0]
+        if (! empty($data['result']['image_urls'][0])) {
+            return (string) $data['result']['image_urls'][0];
         }
 
         return '';
@@ -258,6 +333,12 @@ class WCAIG_Worker
      */
     private function process_queue(): void
     {
+        // Skip queue if rate-limit cooldown is active.
+        if ($this->is_rate_limited()) {
+            WCAIG_Logger::instance()->debug('Worker: rate-limit cooldown active, skipping queue.');
+            return;
+        }
+
         $max_concurrent = $this->get_option('wcaig_max_concurrent', 5);
         $max_retries    = $this->get_option('wcaig_retry_count', 3);
 
@@ -299,15 +380,28 @@ class WCAIG_Worker
             ],
         ]);
 
-        foreach ($drafts as $draft) {
-            $this->process_draft($draft);
+        foreach ($drafts as $index => $draft) {
+            // Add delay between API calls to avoid upstream rate limits.
+            if ($index > 0) {
+                sleep(5);
+            }
+
+            $result = $this->process_draft($draft);
+
+            // Stop processing if we hit a rate limit.
+            if ($result === 'rate_limited') {
+                WCAIG_Logger::instance()->info('Worker: rate-limit hit during queue processing, stopping.');
+                break;
+            }
         }
     }
 
     /**
      * Process a single draft post.
+     *
+     * @return string 'ok', 'error', or 'rate_limited'
      */
-    private function process_draft(WP_Post $draft): void
+    private function process_draft(WP_Post $draft): string
     {
         $post_id    = $draft->ID;
         $product_id = get_field('wcaig_parent_product', $post_id);
@@ -316,14 +410,14 @@ class WCAIG_Worker
         if (! $product_id) {
             WCAIG_Logger::instance()->error("Worker: variation {$post_id} has no parent product.");
             wp_update_post([ 'ID' => $post_id, 'post_status' => 'failed' ]);
-            return;
+            return 'error';
         }
 
         $product = wc_get_product($product_id);
         if (! $product) {
             WCAIG_Logger::instance()->error("Worker: product {$product_id} not found for variation {$post_id}.");
             wp_update_post([ 'ID' => $post_id, 'post_status' => 'failed' ]);
-            return;
+            return 'error';
         }
 
         // Get base image URL.
@@ -331,7 +425,7 @@ class WCAIG_Worker
         if (empty($base_image_url)) {
             WCAIG_Logger::instance()->error("Worker: no base image for product {$product_id}, marking variation {$post_id} as failed.");
             wp_update_post([ 'ID' => $post_id, 'post_status' => 'failed' ]);
-            return;
+            return 'error';
         }
 
         // Derive enabled attributes from base_attr fields.
@@ -339,7 +433,7 @@ class WCAIG_Worker
         if (empty($enabled)) {
             WCAIG_Logger::instance()->error("Worker: no base attributes configured for product {$product_id}.");
             wp_update_post([ 'ID' => $post_id, 'post_status' => 'failed' ]);
-            return;
+            return 'error';
         }
 
         // Build prompt.
@@ -350,6 +444,13 @@ class WCAIG_Worker
         $task_id = WCAIG_API_Client::instance()->create_task($prompt, $base_image_url, $hash);
 
         if (is_wp_error($task_id)) {
+            // If rate-limited at the HTTP level, set cooldown and leave draft as-is.
+            if ($task_id->get_error_code() === 'piapi_rate_limit') {
+                $this->set_rate_limit_cooldown();
+                WCAIG_Logger::instance()->warning("Worker: PIAPI rate-limited for {$post_id}, cooldown activated.");
+                return 'rate_limited';
+            }
+
             $retry_count = (int) get_field('wcaig_retry_count', $post_id);
             $retry_count++;
             update_field('wcaig_retry_count', $retry_count, $post_id);
@@ -360,7 +461,7 @@ class WCAIG_Worker
             } else {
                 WCAIG_Logger::instance()->warning("Worker: PIAPI failed for {$post_id}, will retry ({$retry_count}/{$max_retries}).");
             }
-            return;
+            return 'error';
         }
 
         // Success: save task_id and transition to processing.
@@ -371,6 +472,7 @@ class WCAIG_Worker
         ]);
 
         WCAIG_Logger::instance()->info("Worker: submitted variation {$post_id} to PIAPI, task={$task_id}");
+        return 'ok';
     }
 
     /**

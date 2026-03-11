@@ -79,6 +79,12 @@ class WCAIG_API_Client
         $code = wp_remote_retrieve_response_code($response);
         $body = json_decode(wp_remote_retrieve_body($response), true);
 
+        // Detect HTTP-level rate limiting (429).
+        if ($code === 429) {
+            WCAIG_Logger::instance()->warning('PIAPI rate limited (HTTP 429).');
+            return new WP_Error('piapi_rate_limit', 'Too many requests (HTTP 429)');
+        }
+
         if ($code !== 200) {
             $error_msg = $body['error'] ?? "HTTP {$code}";
             WCAIG_Logger::instance()->error("PIAPI returned error: {$error_msg}");
