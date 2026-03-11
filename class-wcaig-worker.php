@@ -1,0 +1,484 @@
+<?php
+
+/**
+ * WCAIG Worker — Background queue worker for processing image generation tasks.
+ *
+ * @package WC_AI_Image_Gen
+ */
+
+if (! defined('ABSPATH')) {
+    exit;
+}
+
+class WCAIG_Worker
+{
+    private static ?WCAIG_Worker $instance = null;
+
+    public static function instance(): self
+    {
+        if (null === self::$instance) {
+            self::$instance = new self();
+        }
+        return self::$instance;
+    }
+
+    private function __construct()
+    {
+        add_action('wcaig_worker_cron', [ $this, 'run' ]);
+    }
+
+    /**
+     * Run one worker cycle.
+     */
+    public function run(): void
+    {
+        // Acquire mutex.
+        if (get_transient('wcaig_worker_running')) {
+            WCAIG_Logger::instance()->debug('Worker: mutex held, skipping run.');
+            return;
+        }
+
+        set_transient('wcaig_worker_running', true, 5 * MINUTE_IN_SECONDS);
+
+        try {
+            // Step 1: Poll processing tasks for completion.
+            $this->poll_processing_tasks();
+
+            // Step 2: Handle timed-out processing posts.
+            $this->handle_timeouts();
+
+            // Step 3: Process draft queue.
+            $this->process_queue();
+        } finally {
+            // Release mutex.
+            delete_transient('wcaig_worker_running');
+        }
+    }
+
+    /**
+     * Poll PIAPI for status of all processing tasks (webhook fallback).
+     */
+    private function poll_processing_tasks(): void
+    {
+        $processing_posts = get_posts([
+            'post_type'      => 'image_variation',
+            'post_status'    => 'processing',
+            'posts_per_page' => 20,
+            'orderby'        => 'modified',
+            'order'          => 'ASC',
+        ]);
+
+        if (empty($processing_posts)) {
+            return;
+        }
+
+        WCAIG_Logger::instance()->debug('Worker poll: checking ' . count($processing_posts) . ' processing tasks.');
+
+        $api = WCAIG_API_Client::instance();
+
+        foreach ($processing_posts as $post) {
+            $task_id = get_field('wcaig_task_id', $post->ID);
+            if (empty($task_id)) {
+                continue;
+            }
+
+            $task_data = $api->fetch_task($task_id);
+            if (is_wp_error($task_data)) {
+                WCAIG_Logger::instance()->warning("Worker poll: fetch failed for task={$task_id}: {$task_data->get_error_message()}");
+                continue;
+            }
+
+            $status = $task_data['status'] ?? '';
+
+            if ($status === 'completed') {
+                $this->handle_poll_completed($post, $task_data);
+            } elseif ($status === 'failed') {
+                $this->handle_poll_failed($post, $task_id);
+            }
+            // 'processing' / 'pending' — do nothing, wait for next cycle.
+        }
+    }
+
+    /**
+     * Handle a completed task discovered by polling.
+     */
+    private function handle_poll_completed(WP_Post $post, array $task_data): void
+    {
+        // Idempotency: skip already-published posts.
+        if ($post->post_status === 'publish') {
+            return;
+        }
+
+        $hash = str_replace('variation_', '', $post->post_name);
+
+        // Extract image URL (same structure as webhook response).
+        $image_url = $this->extract_image_url_from_task($task_data);
+
+        if (empty($image_url)) {
+            WCAIG_Logger::instance()->error("Worker poll: no image URL in task data for post {$post->ID}");
+            return;
+        }
+
+        // Sideload image.
+        $attachment_id = WCAIG_API_Client::instance()->sideload_image($image_url, $post->ID, $hash);
+
+        if (is_wp_error($attachment_id)) {
+            WCAIG_Logger::instance()->error("Worker poll: sideload failed for post {$post->ID}: {$attachment_id->get_error_message()}");
+            return;
+        }
+
+        // Set as featured image.
+        set_post_thumbnail($post->ID, $attachment_id);
+
+        // Publish the post.
+        wp_update_post([
+            'ID'          => $post->ID,
+            'post_status' => 'publish',
+        ]);
+
+        // Cache the image URL.
+        $attachment_url = wp_get_attachment_url($attachment_id);
+        if ($attachment_url) {
+            set_transient("wcaig_image_{$hash}", $attachment_url, DAY_IN_SECONDS);
+        }
+
+        WCAIG_Logger::instance()->info("Worker poll: published variation {$hash} (post {$post->ID})");
+    }
+
+    /**
+     * Handle a failed task discovered by polling.
+     */
+    private function handle_poll_failed(WP_Post $post, string $task_id): void
+    {
+        $max_retries = $this->get_option('wcaig_retry_count', 3);
+        $retry_count = (int) get_field('wcaig_retry_count', $post->ID);
+        $retry_count++;
+
+        update_field('wcaig_retry_count', $retry_count, $post->ID);
+
+        if ($retry_count >= $max_retries) {
+            wp_update_post([
+                'ID'          => $post->ID,
+                'post_status' => 'failed',
+            ]);
+            WCAIG_Logger::instance()->error("Worker poll: variation {$post->ID} failed after {$retry_count} retries (task={$task_id}).");
+        } else {
+            wp_update_post([
+                'ID'          => $post->ID,
+                'post_status' => 'draft',
+            ]);
+            update_field('wcaig_task_id', '', $post->ID);
+            WCAIG_Logger::instance()->info("Worker poll: variation {$post->ID} failed, reset for retry ({$retry_count}/{$max_retries}).");
+        }
+    }
+
+    /**
+     * Extract image URL from PIAPI task data.
+     */
+    private function extract_image_url_from_task(array $data): string
+    {
+        // output.image_url
+        if (! empty($data['output']['image_url'])) {
+            return $data['output']['image_url'];
+        }
+
+        // output.images[0]
+        if (! empty($data['output']['images'][0])) {
+            $img = $data['output']['images'][0];
+            return is_array($img) ? ($img['url'] ?? '') : (string) $img;
+        }
+
+        // result.image_url
+        if (! empty($data['result']['image_url'])) {
+            return $data['result']['image_url'];
+        }
+
+        return '';
+    }
+
+    /**
+     * Check for timed-out processing posts and handle them.
+     */
+    private function handle_timeouts(): void
+    {
+        $timeout_minutes = $this->get_option('wcaig_task_timeout', 30);
+        $max_retries     = $this->get_option('wcaig_retry_count', 3);
+
+        $processing_posts = get_posts([
+            'post_type'      => 'image_variation',
+            'post_status'    => 'processing',
+            'posts_per_page' => -1,
+        ]);
+
+        foreach ($processing_posts as $post) {
+            $modified_time = strtotime($post->post_modified_gmt);
+            $elapsed       = (time() - $modified_time) / 60; // minutes
+
+            if ($elapsed > $timeout_minutes) {
+                $retry_count = (int) get_field('wcaig_retry_count', $post->ID);
+                $retry_count++;
+
+                update_field('wcaig_retry_count', $retry_count, $post->ID);
+
+                if ($retry_count >= $max_retries) {
+                    wp_update_post([
+                        'ID'          => $post->ID,
+                        'post_status' => 'failed',
+                    ]);
+                    WCAIG_Logger::instance()->error("Worker: variation {$post->ID} timed out, marked failed ({$retry_count}/{$max_retries}).");
+                } else {
+                    wp_update_post([
+                        'ID'          => $post->ID,
+                        'post_status' => 'draft',
+                    ]);
+                    update_field('wcaig_task_id', '', $post->ID);
+                    WCAIG_Logger::instance()->info("Worker: variation {$post->ID} timed out, reset to draft ({$retry_count}/{$max_retries}).");
+                }
+            }
+        }
+    }
+
+    /**
+     * Process the draft queue.
+     */
+    private function process_queue(): void
+    {
+        $max_concurrent = $this->get_option('wcaig_max_concurrent', 5);
+        $max_retries    = $this->get_option('wcaig_retry_count', 3);
+
+        // Count currently processing posts.
+        $active_query = new WP_Query([
+            'post_type'      => 'image_variation',
+            'post_status'    => 'processing',
+            'posts_per_page' => 1,
+            'fields'         => 'ids',
+        ]);
+        $active_count = $active_query->found_posts;
+
+        if ($active_count >= $max_concurrent) {
+            WCAIG_Logger::instance()->debug("Worker: max concurrent reached ({$active_count}/{$max_concurrent}), skipping queue.");
+            return;
+        }
+
+        $slots = $max_concurrent - $active_count;
+
+        // Pick oldest drafts that haven't exhausted retries.
+        $drafts = get_posts([
+            'post_type'      => 'image_variation',
+            'post_status'    => 'draft',
+            'posts_per_page' => $slots,
+            'orderby'        => 'date',
+            'order'          => 'ASC',
+            'meta_query'     => [
+                'relation' => 'OR',
+                [
+                    'key'     => 'wcaig_retry_count',
+                    'value'   => $max_retries,
+                    'compare' => '<',
+                    'type'    => 'NUMERIC',
+                ],
+                [
+                    'key'     => 'wcaig_retry_count',
+                    'compare' => 'NOT EXISTS',
+                ],
+            ],
+        ]);
+
+        foreach ($drafts as $draft) {
+            $this->process_draft($draft);
+        }
+    }
+
+    /**
+     * Process a single draft post.
+     */
+    private function process_draft(WP_Post $draft): void
+    {
+        $post_id    = $draft->ID;
+        $product_id = get_field('wcaig_parent_product', $post_id);
+        $max_retries = $this->get_option('wcaig_retry_count', 3);
+
+        if (! $product_id) {
+            WCAIG_Logger::instance()->error("Worker: variation {$post_id} has no parent product.");
+            wp_update_post([ 'ID' => $post_id, 'post_status' => 'failed' ]);
+            return;
+        }
+
+        $product = wc_get_product($product_id);
+        if (! $product) {
+            WCAIG_Logger::instance()->error("Worker: product {$product_id} not found for variation {$post_id}.");
+            wp_update_post([ 'ID' => $post_id, 'post_status' => 'failed' ]);
+            return;
+        }
+
+        // Get base image URL.
+        $base_image_url = $this->get_base_image_url($product_id, $product);
+        if (empty($base_image_url)) {
+            WCAIG_Logger::instance()->error("Worker: no base image for product {$product_id}, marking variation {$post_id} as failed.");
+            wp_update_post([ 'ID' => $post_id, 'post_status' => 'failed' ]);
+            return;
+        }
+
+        // Derive enabled attributes from base_attr fields.
+        $enabled = WCAIG_Hash::get_enabled_attributes($product_id);
+        if (empty($enabled)) {
+            WCAIG_Logger::instance()->error("Worker: no base attributes configured for product {$product_id}.");
+            wp_update_post([ 'ID' => $post_id, 'post_status' => 'failed' ]);
+            return;
+        }
+
+        // Build prompt.
+        $prompt = $this->build_prompt($post_id, $product_id, $enabled);
+        $hash   = str_replace('variation_', '', $draft->post_name);
+
+        // Send to PIAPI.
+        $task_id = WCAIG_API_Client::instance()->create_task($prompt, $base_image_url, $hash);
+
+        if (is_wp_error($task_id)) {
+            $retry_count = (int) get_field('wcaig_retry_count', $post_id);
+            $retry_count++;
+            update_field('wcaig_retry_count', $retry_count, $post_id);
+
+            if ($retry_count >= $max_retries) {
+                wp_update_post([ 'ID' => $post_id, 'post_status' => 'failed' ]);
+                WCAIG_Logger::instance()->error("Worker: PIAPI failed for {$post_id}, marked failed ({$retry_count}/{$max_retries}).");
+            } else {
+                WCAIG_Logger::instance()->warning("Worker: PIAPI failed for {$post_id}, will retry ({$retry_count}/{$max_retries}).");
+            }
+            return;
+        }
+
+        // Success: save task_id and transition to processing.
+        update_field('wcaig_task_id', $task_id, $post_id);
+        wp_update_post([
+            'ID'          => $post_id,
+            'post_status' => 'processing',
+        ]);
+
+        WCAIG_Logger::instance()->info("Worker: submitted variation {$post_id} to PIAPI, task={$task_id}");
+    }
+
+    /**
+     * Build the prompt for a variation.
+     */
+    private function build_prompt(int $post_id, int $product_id, array $enabled): string
+    {
+        $prompt_parts = [];
+
+        foreach ($enabled as $attr_name) {
+            $base_term   = get_field("wcaig_base_attr_{$attr_name}", $product_id);
+            $target_term = get_field("wcaig_attr_{$attr_name}", $post_id);
+
+            if (! ($base_term instanceof WP_Term) || ! ($target_term instanceof WP_Term)) {
+                continue;
+            }
+
+            // Get term metadata for base and target.
+            $base_meta   = $this->get_term_meta_for_term($base_term);
+            $target_meta = $this->get_term_meta_for_term($target_term);
+
+            $base_str   = ucfirst($base_term->name);
+            $target_str = ucfirst($target_term->name);
+
+            if (! empty($base_meta)) {
+                $base_str .= " ({$base_meta})";
+            }
+
+            if (! empty($target_meta)) {
+                $target_str .= " ({$target_meta})";
+            }
+
+            $prompt_parts[] = "Replace all {$attr_name} {$base_str} with {$target_str}.";
+        }
+
+        $prompt = implode(' ', $prompt_parts);
+        $prompt .= ' Preserve the product shape, texture, lighting, shadows, reflections, and background.';
+
+        // Append custom preservation rules.
+        $custom_rules = '';
+        if (function_exists('get_field')) {
+            $custom_rules = get_field('wcaig_preservation_rules', 'option');
+        }
+        if (! empty($custom_rules)) {
+            $prompt .= ' ' . trim($custom_rules);
+        }
+
+        WCAIG_Logger::instance()->debug("Worker: built prompt: {$prompt}");
+        return $prompt;
+    }
+
+    /**
+     * Get formatted term metadata string from a WP_Term object.
+     */
+    private function get_term_meta_for_term(WP_Term $term): string
+    {
+        $taxonomy = $term->taxonomy;
+        $acf_id   = "{$taxonomy}_{$term->term_id}";
+
+        $meta = [];
+        $hex  = get_field('wcaig_term_color_hex', $acf_id);
+        $rgb  = get_field('wcaig_term_color_rgb', $acf_id);
+        $desc = get_field('wcaig_term_description', $acf_id);
+
+        if (! empty($hex)) {
+            $meta[] = $hex;
+        }
+        if (! empty($rgb)) {
+            $meta[] = $rgb;
+        }
+        if (! empty($desc)) {
+            $meta[] = $desc;
+        }
+
+        if (empty($meta)) {
+            WCAIG_Logger::instance()->warning("Worker: term '{$term->name}' in {$taxonomy} has no metadata.");
+        }
+
+        return implode(', ', $meta);
+    }
+
+    /**
+     * Get the base image URL for a product.
+     */
+    private function get_base_image_url(int $product_id, WC_Product $product): string
+    {
+        $base_image = get_field('wcaig_base_image', $product_id);
+
+        if ($base_image) {
+            if (is_numeric($base_image)) {
+                $url = wp_get_attachment_url($base_image);
+                if ($url) {
+                    return $url;
+                }
+            }
+            if (is_array($base_image) && ! empty($base_image['url'])) {
+                return $base_image['url'];
+            }
+            if (is_string($base_image) && ! empty($base_image)) {
+                return $base_image;
+            }
+        }
+
+        // Fallback: product featured image.
+        $thumb_id = $product->get_image_id();
+        if ($thumb_id) {
+            return wp_get_attachment_url($thumb_id) ?: '';
+        }
+
+        return '';
+    }
+
+    /**
+     * Get an ACF option value with default.
+     */
+    private function get_option(string $field, mixed $default = ''): mixed
+    {
+        if (function_exists('get_field')) {
+            $value = get_field($field, 'option');
+            if ($value !== null && $value !== '' && $value !== false) {
+                return $value;
+            }
+        }
+        return $default;
+    }
+}
