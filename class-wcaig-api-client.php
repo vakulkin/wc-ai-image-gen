@@ -48,8 +48,8 @@ class WCAIG_API_Client
             'model'     => $model,
             'task_type' => $task_type,
             'input'     => [
-                'prompt'    => $prompt,
-                'image_url' => $image_url,
+                'prompt'     => $prompt,
+                'image_urls' => [ $image_url ],
             ],
             'config'    => [
                 'webhook_config' => [
@@ -61,6 +61,8 @@ class WCAIG_API_Client
                 'wcaig_hash' => $hash,
             ],
         ];
+
+        WCAIG_Logger::instance()->debug("PIAPI payload: model={$model}, task_type={$task_type}, image_url={$image_url}, hash={$hash}");
 
         $response = wp_remote_post(self::PIAPI_URL, [
             'headers' => [
