@@ -172,6 +172,9 @@ class WCAIG_REST_API
 
         WCAIG_Logger::instance()->info("New variation created: hash={$hash}, product={$product_id}");
 
+        // Trigger async worker so the draft is processed immediately.
+        $this->trigger_async_processing();
+
         return new WP_REST_Response([
             'status' => 'created',
             'hash'   => $hash,
@@ -264,6 +267,9 @@ class WCAIG_REST_API
         update_field('wcaig_retry_count', 0, $post->ID);
 
         WCAIG_Logger::instance()->info("Auto-retry: reset failed variation {$hash} to draft.");
+
+        // Trigger async worker so the retried draft is processed immediately.
+        $this->trigger_async_processing();
 
         return new WP_REST_Response([
             'status' => 'pending',
@@ -358,6 +364,33 @@ class WCAIG_REST_API
         }
 
         return '';
+    }
+
+    /**
+     * Trigger async processing so draft variations are picked up immediately.
+     *
+     * 1. Ensures the cron event is scheduled (self-healing after migration).
+     * 2. Fires a non-blocking loopback to wp-cron.php to run the worker now.
+     */
+    private function trigger_async_processing(): void
+    {
+        // Ensure cron event exists (self-healing after migration).
+        if (! wp_next_scheduled('wcaig_worker_cron')) {
+            wp_schedule_event(time(), 'wcaig_every_minute', 'wcaig_worker_cron');
+            WCAIG_Logger::instance()->info('REST API: re-scheduled missing wcaig_worker_cron event.');
+        }
+
+        // Fire a non-blocking loopback request to trigger cron immediately.
+        $cron_url = site_url('/wp-cron.php');
+
+        wp_remote_post($cron_url, [
+            'timeout'   => 0.01,
+            'blocking'  => false,
+            'sslverify' => apply_filters('https_local_ssl_verify', false),
+            'body'      => [],
+        ]);
+
+        WCAIG_Logger::instance()->debug('REST API: triggered async cron loopback.');
     }
 
     /**

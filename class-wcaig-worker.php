@@ -25,6 +25,21 @@ class WCAIG_Worker
     private function __construct()
     {
         add_action('wcaig_worker_cron', [ $this, 'run' ]);
+
+        // Self-healing: ensure cron event is always scheduled (survives migration).
+        add_action('init', [ $this, 'ensure_cron_scheduled' ]);
+    }
+
+    /**
+     * Ensure the worker cron event is scheduled.
+     * Self-healing mechanism that re-schedules if the event was lost (e.g. after site migration).
+     */
+    public function ensure_cron_scheduled(): void
+    {
+        if (! wp_next_scheduled('wcaig_worker_cron')) {
+            wp_schedule_event(time(), 'wcaig_every_minute', 'wcaig_worker_cron');
+            WCAIG_Logger::instance()->info('Worker: re-scheduled missing wcaig_worker_cron event.');
+        }
     }
 
     /**
