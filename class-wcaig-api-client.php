@@ -165,6 +165,15 @@ class WCAIG_API_Client
             return new WP_Error('empty_image', 'Downloaded image is empty');
         }
 
+        // Ensure admin file utilities are available (needed for wp_tempnam, media_handle_sideload, etc.).
+        if (! function_exists('wp_tempnam')) {
+            require_once ABSPATH . 'wp-admin/includes/file.php';
+        }
+        if (! function_exists('media_handle_sideload')) {
+            require_once ABSPATH . 'wp-admin/includes/media.php';
+            require_once ABSPATH . 'wp-admin/includes/image.php';
+        }
+
         // Save to temp file and attempt WebP conversion.
         $temp_file = wp_tempnam('wcaig_');
         file_put_contents($temp_file, $image_data);
@@ -190,12 +199,6 @@ class WCAIG_API_Client
             'name'     => WCAIG_Hash::get_filename($hash),
             'tmp_name' => $webp_file,
         ];
-
-        if (! function_exists('media_handle_sideload')) {
-            require_once ABSPATH . 'wp-admin/includes/file.php';
-            require_once ABSPATH . 'wp-admin/includes/media.php';
-            require_once ABSPATH . 'wp-admin/includes/image.php';
-        }
 
         $attachment_id = media_handle_sideload($file_array, $product_id);
 
