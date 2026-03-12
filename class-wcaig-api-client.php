@@ -310,6 +310,7 @@ class WCAIG_API_Client
      */
     public static function is_rate_limited(): bool
     {
+        return false;
         return (bool) get_transient('wcaig_rate_limit_cooldown');
     }
 

@@ -93,7 +93,7 @@ class WCAIG_Hash
 
         $posts = get_posts([
             'post_type'      => 'attachment',
-            'post_status'    => 'inherit',
+            // 'post_status'    => 'inherit',
             'meta_query'     => $meta_query,
             'posts_per_page' => 1,
         ]);
