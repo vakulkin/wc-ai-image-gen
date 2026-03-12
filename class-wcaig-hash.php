@@ -98,6 +98,8 @@ class WCAIG_Hash
             'posts_per_page' => 1,
         ]);
 
+        error_log("find_attachment: hash={$hash}, status={$status}, found=" . count($posts));
+
         return ! empty($posts) ? $posts[0] : null;
     }
 
