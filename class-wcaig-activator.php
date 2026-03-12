@@ -17,9 +17,8 @@ class WCAIG_Activator
      */
     public static function activate(): void
     {
-        // Register CPT so rewrite rules exist.
-        WCAIG_CPT::instance()->register_post_type();
-        WCAIG_CPT::instance()->register_custom_statuses();
+        // Create/update the queue table.
+        WCAIG_Queue::create_table();
 
         // Schedule WP-Cron events.
         if (! wp_next_scheduled('wcaig_worker_cron')) {
@@ -29,9 +28,6 @@ class WCAIG_Activator
         if (! wp_next_scheduled('wcaig_gc_cron')) {
             wp_schedule_event(time(), 'daily', 'wcaig_gc_cron');
         }
-
-        // Flush rewrite rules.
-        flush_rewrite_rules();
     }
 
     /**
@@ -46,8 +42,5 @@ class WCAIG_Activator
         // Delete mutex transients.
         delete_transient('wcaig_worker_running');
         delete_transient('wcaig_gc_running');
-
-        // Flush rewrite rules.
-        flush_rewrite_rules();
     }
 }

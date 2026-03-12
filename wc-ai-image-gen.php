@@ -75,7 +75,7 @@ function wcaig_init(): void
     // Include class files.
     require_once WCAIG_PLUGIN_DIR . 'class-wcaig-logger.php';
     require_once WCAIG_PLUGIN_DIR . 'class-wcaig-hash.php';
-    require_once WCAIG_PLUGIN_DIR . 'class-wcaig-cpt.php';
+    require_once WCAIG_PLUGIN_DIR . 'class-wcaig-queue.php';
     require_once WCAIG_PLUGIN_DIR . 'class-wcaig-activator.php';
     require_once WCAIG_PLUGIN_DIR . 'class-wcaig-acf.php';
     require_once WCAIG_PLUGIN_DIR . 'class-wcaig-api-client.php';
@@ -83,20 +83,17 @@ function wcaig_init(): void
     require_once WCAIG_PLUGIN_DIR . 'class-wcaig-webhook-handler.php';
     require_once WCAIG_PLUGIN_DIR . 'class-wcaig-worker.php';
     require_once WCAIG_PLUGIN_DIR . 'class-wcaig-garbage-collector.php';
-    require_once WCAIG_PLUGIN_DIR . 'class-wcaig-statistics.php';
     require_once WCAIG_PLUGIN_DIR . 'class-wcaig-frontend.php';
 
     // Instantiate singletons.
     WCAIG_Logger::instance();
-    WCAIG_Hash::instance();
-    WCAIG_CPT::instance();
+    WCAIG_Queue::instance();
     WCAIG_ACF::instance();
     WCAIG_API_Client::instance();
     WCAIG_REST_API::instance();
     WCAIG_Webhook_Handler::instance();
     WCAIG_Worker::instance();
     WCAIG_Garbage_Collector::instance();
-    WCAIG_Statistics::instance();
     WCAIG_Frontend::instance();
 }
 
@@ -115,7 +112,7 @@ add_action('before_woocommerce_init', function (): void {
 register_activation_hook(__FILE__, function () {
     require_once plugin_dir_path(__FILE__) . 'class-wcaig-logger.php';
     require_once plugin_dir_path(__FILE__) . 'class-wcaig-hash.php';
-    require_once plugin_dir_path(__FILE__) . 'class-wcaig-cpt.php';
+    require_once plugin_dir_path(__FILE__) . 'class-wcaig-queue.php';
     require_once plugin_dir_path(__FILE__) . 'class-wcaig-activator.php';
     WCAIG_Activator::activate();
 });

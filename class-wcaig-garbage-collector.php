@@ -1,7 +1,14 @@
 <?php
 
 /**
- * WCAIG Garbage Collector — Cleanup old and orphaned image variations.
+ * WCAIG Garbage Collector — Removes orphaned images and expired queue entries.
+ *
+ * An image is orphaned when:
+ *   1. Its parent product no longer exists, OR
+ *   2. Any of the attribute terms stored in _wcaig_attributes no longer exist
+ *      in their respective pa_* taxonomy.
+ *
+ * Time-based deletion is NOT used — images stay as long as they remain valid.
  *
  * @package WC_AI_Image_Gen
  */
@@ -15,8 +22,6 @@ class WCAIG_Garbage_Collector
     private static ?WCAIG_Garbage_Collector $instance = null;
 
     private const BATCH_SIZE = 50;
-    private const FAILED_AGE_DAYS    = 3;
-    private const PUBLISHED_AGE_DAYS = 7;
 
     public static function instance(): self
     {
@@ -28,7 +33,7 @@ class WCAIG_Garbage_Collector
 
     private function __construct()
     {
-        add_action('wcaig_gc_cron', [ $this, 'run' ]);
+        add_action('wcaig_gc_cron', [$this, 'run']);
     }
 
     /**
@@ -36,150 +41,121 @@ class WCAIG_Garbage_Collector
      */
     public function run(): void
     {
-        // Acquire mutex.
         if (get_transient('wcaig_gc_running')) {
-            WCAIG_Logger::instance()->debug('GC: mutex held, skipping run.');
             return;
         }
 
         set_transient('wcaig_gc_running', true, 10 * MINUTE_IN_SECONDS);
 
-        $dry_run = $this->is_dry_run();
+        $dry_run = (bool) WCAIG_Hash::get_option('wcaig_dryrun_gc', false);
 
         try {
-            $this->clean_old_failed($dry_run);
-            $this->clean_old_published($dry_run);
-            $this->clean_orphaned_media($dry_run);
+            $this->purge_expired_queue($dry_run);
+            $this->clean_orphaned_attachments($dry_run);
         } finally {
             delete_transient('wcaig_gc_running');
         }
     }
 
     /**
-     * Task 1: Delete failed variations older than 3 days.
+     * Purge expired queue entries (TTL exceeded).
      */
-    private function clean_old_failed(bool $dry_run): void
+    private function purge_expired_queue(bool $dry_run): void
     {
-        $cutoff = gmdate('Y-m-d H:i:s', time() - self::FAILED_AGE_DAYS * DAY_IN_SECONDS);
+        if ($dry_run) {
+            $count = WCAIG_Queue::instance()->count();
+            WCAIG_Logger::instance()->info("GC dry-run: queue has {$count} entries total.");
+            return;
+        }
 
-        $posts = get_posts([
-            'post_type'      => 'image_variation',
-            'post_status'    => 'failed',
-            'posts_per_page' => self::BATCH_SIZE,
-            'date_query'     => [
-                [
-                    'column' => 'post_modified_gmt',
-                    'before' => $cutoff,
-                ],
-            ],
-            'orderby'        => 'post_modified',
-            'order'          => 'ASC',
-        ]);
-
-        foreach ($posts as $post) {
-            if ($dry_run) {
-                WCAIG_Logger::instance()->info("GC dry-run: would delete failed variation {$post->ID}");
-                continue;
-            }
-
-            // Delete featured image attachment.
-            $thumb_id = get_post_thumbnail_id($post->ID);
-            if ($thumb_id) {
-                wp_delete_attachment($thumb_id, true);
-            }
-
-            wp_delete_post($post->ID, true);
-            WCAIG_Logger::instance()->info("GC: deleted failed variation {$post->ID}");
+        $purged = WCAIG_Queue::instance()->purge_expired();
+        if ($purged > 0) {
+            WCAIG_Logger::instance()->info("GC: purged {$purged} expired queue entries.");
         }
     }
 
     /**
-     * Task 2: Delete published variations older than 7 days.
+     * Delete WCAIG attachments whose product or attribute terms no longer exist.
      */
-    private function clean_old_published(bool $dry_run): void
-    {
-        $cutoff = gmdate('Y-m-d H:i:s', time() - self::PUBLISHED_AGE_DAYS * DAY_IN_SECONDS);
-
-        $posts = get_posts([
-            'post_type'      => 'image_variation',
-            'post_status'    => 'publish',
-            'posts_per_page' => self::BATCH_SIZE,
-            'date_query'     => [
-                [
-                    'column' => 'post_modified_gmt',
-                    'before' => $cutoff,
-                ],
-            ],
-            'orderby'        => 'post_modified',
-            'order'          => 'ASC',
-        ]);
-
-        foreach ($posts as $post) {
-            $hash = str_replace('variation_', '', $post->post_name);
-
-            if ($dry_run) {
-                WCAIG_Logger::instance()->info("GC dry-run: would delete published variation {$post->ID} (hash={$hash})");
-                continue;
-            }
-
-            // Delete featured image attachment.
-            $thumb_id = get_post_thumbnail_id($post->ID);
-            if ($thumb_id) {
-                wp_delete_attachment($thumb_id, true);
-            }
-
-            // Delete transient.
-            delete_transient("wcaig_image_{$hash}");
-
-            wp_delete_post($post->ID, true);
-            WCAIG_Logger::instance()->info("GC: deleted published variation {$post->ID} (hash={$hash})");
-        }
-    }
-
-    /**
-     * Task 3: Delete orphaned WCAIG media attachments.
-     */
-    private function clean_orphaned_media(bool $dry_run): void
+    private function clean_orphaned_attachments(bool $dry_run): void
     {
         global $wpdb;
 
-        $attachments = $wpdb->get_results(
-            "SELECT ID, post_parent FROM {$wpdb->posts}
-             WHERE post_type = 'attachment'
-               AND post_title LIKE 'wcaig_%'
-             LIMIT " . self::BATCH_SIZE
+        // Get all attachment IDs that have _wcaig_hash meta.
+        $attachment_ids = $wpdb->get_col(
+            $wpdb->prepare(
+                "SELECT post_id FROM {$wpdb->postmeta}
+                 WHERE meta_key = '_wcaig_hash'
+                 LIMIT %d",
+                self::BATCH_SIZE
+            )
         );
 
-        foreach ($attachments as $attachment) {
-            $parent_exists = false;
+        $deleted = 0;
 
-            if ((int) $attachment->post_parent > 0) {
-                $parent = get_post($attachment->post_parent);
-                if ($parent && $parent->post_type === 'image_variation') {
-                    $parent_exists = true;
-                }
+        foreach ($attachment_ids as $attachment_id) {
+            $attachment_id = (int) $attachment_id;
+            $hash       = get_post_meta($attachment_id, '_wcaig_hash', true);
+            $product_id = (int) get_post_meta($attachment_id, '_wcaig_product_id', true);
+            $attrs_json = get_post_meta($attachment_id, '_wcaig_attributes', true);
+
+            $reason = $this->get_orphan_reason($product_id, $attrs_json);
+
+            if ($reason === null) {
+                continue; // Still valid.
             }
 
-            if (! $parent_exists) {
-                if ($dry_run) {
-                    WCAIG_Logger::instance()->info("GC dry-run: would delete orphaned attachment {$attachment->ID}");
-                    continue;
-                }
-
-                wp_delete_attachment((int) $attachment->ID, true);
-                WCAIG_Logger::instance()->info("GC: deleted orphaned attachment {$attachment->ID}");
+            if ($dry_run) {
+                WCAIG_Logger::instance()->info("GC dry-run: would delete attachment {$attachment_id} (hash={$hash}, reason={$reason})");
+                continue;
             }
+
+            wp_delete_attachment($attachment_id, true);
+            $deleted++;
+
+            WCAIG_Logger::instance()->info("GC: deleted orphaned attachment {$attachment_id} (hash={$hash}, reason={$reason})");
+        }
+
+        if ($deleted > 0) {
+            WCAIG_Logger::instance()->info("GC: deleted {$deleted} orphaned attachments.");
         }
     }
 
     /**
-     * Check if dry-run mode is enabled.
+     * Determine why an attachment is orphaned, or null if still valid.
+     *
+     * @param int    $product_id  Product ID from _wcaig_product_id meta.
+     * @param string $attrs_json  JSON from _wcaig_attributes meta.
+     * @return string|null Reason string if orphaned, null if valid.
      */
-    private function is_dry_run(): bool
+    private function get_orphan_reason(int $product_id, string $attrs_json): ?string
     {
-        if (function_exists('get_field')) {
-            return (bool) get_field('wcaig_dryrun_gc', 'option');
+        // 1. Product must exist.
+        if ($product_id <= 0 || ! wc_get_product($product_id)) {
+            return 'product_missing';
         }
-        return false;
+
+        // 2. Each attribute term must still exist in its pa_* taxonomy.
+        $attributes = json_decode($attrs_json, true);
+
+        if (! is_array($attributes) || empty($attributes)) {
+            // No attributes stored — can't validate, but keep (legacy images).
+            return null;
+        }
+
+        foreach ($attributes as $attr_name => $term_slug) {
+            $taxonomy = 'pa_' . strtolower(trim(preg_replace('/^pa_/', '', $attr_name)));
+
+            if (! taxonomy_exists($taxonomy)) {
+                return "taxonomy_missing:{$taxonomy}";
+            }
+
+            $term = get_term_by('slug', $term_slug, $taxonomy);
+            if (! $term || is_wp_error($term)) {
+                return "term_missing:{$taxonomy}/{$term_slug}";
+            }
+        }
+
+        return null; // All checks passed — attachment is valid.
     }
 }

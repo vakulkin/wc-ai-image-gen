@@ -16,6 +16,7 @@
   var params = wcaig_params;
   var pollTimer = null;
   var currentHash = null;
+  var requestHash = null;
 
   // ─── Hash Computation ─────────────────────────────────
 
@@ -81,7 +82,7 @@
     var attrs = {};
     for (var key in variationAttrs) {
       if (variationAttrs.hasOwnProperty(key)) {
-        var name  = key.replace(/^attribute_/, '').replace(/^pa_/, '');
+        var name = key.replace(/^attribute_/, '').replace(/^pa_/, '');
         var value = variationAttrs[key];
         if (value) {
           attrs[name] = value;
@@ -156,22 +157,14 @@
 
     currentHash = hash;
 
-    // Show loading modal.
-    Swal.fire({
-      title: params.i18n.loading,
-      allowOutsideClick: true,
-      showCloseButton: true,
-      didOpen: function () {
-        Swal.showLoading();
-      },
-    });
+    // Poll silently — no loading modal.
 
     pollTimer = setInterval(function () {
       attempts++;
 
       if (maxAttempts > 0 && attempts > maxAttempts) {
         stopPolling();
-        showError(params.i18n.error, params.i18n.retry);
+        console.warn('[WCAIG] Max poll attempts reached for hash:', hash);
         return;
       }
 
@@ -180,15 +173,18 @@
           if (data.status === 'published') {
             stopPolling();
             showImage(data.image_url);
+          } else if (data.status === 'pending_review') {
+            stopPolling();
+            console.log('[WCAIG] Image generated, awaiting admin approval:', hash);
           } else if (data.status === 'failed') {
             stopPolling();
-            showError(params.i18n.error, params.i18n.retry);
+            console.warn('[WCAIG] Variation failed for hash:', hash);
           }
-          // 'pending' — keep polling.
+          // 'pending' — keep polling silently.
         })
-        .catch(function () {
-          stopPolling();
-          showError(params.i18n.error, params.i18n.retry);
+        .catch(function (err) {
+          console.warn('[WCAIG] Poll error:', err);
+          // Don't stop polling on transient network errors — keep trying.
         });
     }, interval);
   }
@@ -290,9 +286,21 @@
     var hash = computeHash(params.product_id, selected, enabled);
     console.log('[WCAIG] Computed hash:', hash, '| Requesting variation...');
 
+    // Stop any previous polling — only track the latest selection.
+    stopPolling();
+
+    // Track which hash this request is for, so stale responses are ignored.
+    requestHash = hash;
+
     // Request variation image.
     requestVariation(params.product_id, selected)
       .then(function (data) {
+        // Ignore response if user already switched to a different variation.
+        if (requestHash !== hash) {
+          console.log('[WCAIG] Ignoring stale API response for hash:', hash);
+          return;
+        }
+
         console.log('[WCAIG] API response:', data);
         switch (data.status) {
           case 'base_match':
@@ -303,28 +311,29 @@
             showImage(data.image_url);
             break;
 
+          case 'pending_review':
+            // Image generated but awaiting admin approval — do nothing.
+            console.log('[WCAIG] Image awaiting admin approval:', hash);
+            break;
+
           case 'created':
           case 'pending':
             startPolling(data.hash || hash);
             break;
 
           case 'failed':
-            showError(params.i18n.error, params.i18n.retry);
+            console.warn('[WCAIG] Variation failed.');
             break;
 
           default:
             if (data.code === 'cap_reached') {
-              showCapReached();
+              console.warn('[WCAIG] Cap reached.');
             }
             break;
         }
       })
       .catch(function (err) {
-        if (err.message === 'rate_limited') {
-          showError(params.i18n.error, params.i18n.retry);
-        } else {
-          showError(params.i18n.error, params.i18n.retry);
-        }
+        console.warn('[WCAIG] Request error:', err);
       });
   }
 

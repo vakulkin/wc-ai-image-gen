@@ -54,11 +54,11 @@ class WCAIG_Frontend
         $enabled_attributes = array_keys($base_attributes);
 
         // Check base image.
-        $base_image_url = $this->get_base_image_url($product_id);
+        $base_image_url = WCAIG_Hash::get_base_image_url($product_id);
 
         // Get options.
-        $poll_interval    = $this->get_option('wcaig_poll_interval', 10);
-        $max_poll_attempts = $this->get_option('wcaig_max_poll_attempts', 0);
+        $poll_interval    = WCAIG_Hash::get_option('wcaig_poll_interval', 10);
+        $max_poll_attempts = WCAIG_Hash::get_option('wcaig_max_poll_attempts', 0);
 
         $plugin_url = WCAIG_PLUGIN_URL;
 
@@ -127,30 +127,6 @@ class WCAIG_Frontend
     }
 
     /**
-     * Get base image URL for a product.
-     */
-    private function get_base_image_url(int $product_id): string
-    {
-        if (function_exists('get_field')) {
-            $base_image = get_field('wcaig_base_image', $product_id);
-            if (is_array($base_image) && ! empty($base_image['url'])) {
-                return $base_image['url'];
-            }
-            if (is_string($base_image) && ! empty($base_image)) {
-                return $base_image;
-            }
-        }
-
-        // Fallback to product featured image.
-        $thumb_id = get_post_thumbnail_id($product_id);
-        if ($thumb_id) {
-            return (string) wp_get_attachment_url($thumb_id);
-        }
-
-        return '';
-    }
-
-    /**
      * Get base attribute values for a product.
      *
      * Iterates all registered WC attributes and returns only those
@@ -169,19 +145,5 @@ class WCAIG_Frontend
             }
         }
         return $base;
-    }
-
-    /**
-     * Get a plugin option from ACF.
-     */
-    private function get_option(string $field_name, $default = null)
-    {
-        if (function_exists('get_field')) {
-            $value = get_field($field_name, 'option');
-            if (null !== $value && '' !== $value) {
-                return $value;
-            }
-        }
-        return $default;
     }
 }
