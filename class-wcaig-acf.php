@@ -141,8 +141,6 @@ class WCAIG_ACF {
 			'key' => 'group_wcaig_term',
 			'title' => 'AI Image Gen Term Settings',
 			'fields' => [
-				[ 'key' => 'field_wcaig_term_color_hex', 'label' => 'Color HEX', 'name' => 'wcaig_term_color_hex', 'type' => 'color_picker' ],
-				[ 'key' => 'field_wcaig_term_color_rgb', 'label' => 'Color RGB', 'name' => 'wcaig_term_color_rgb', 'type' => 'text', 'instructions' => 'e.g., RGB 0, 184, 217' ],
 				[ 'key' => 'field_wcaig_term_description', 'label' => 'Description', 'name' => 'wcaig_term_description', 'type' => 'text', 'instructions' => 'e.g., bright turquoise cyan' ],
 				[
 					'key'           => 'field_wcaig_term_ref_image',
