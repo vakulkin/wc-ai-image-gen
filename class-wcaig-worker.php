@@ -62,6 +62,16 @@ class WCAIG_Worker
         }
     }
 
+    /**
+     * Force-run a worker cycle, clearing any stale lock first.
+     */
+    public function force_run(): void
+    {
+        delete_transient('wcaig_worker_running');
+        WCAIG_Logger::instance()->info('Worker: force run triggered, lock cleared.');
+        $this->run();
+    }
+
     // ──────────────────────────────────────────────
     // Poll processing tasks (webhook fallback)
     // ──────────────────────────────────────────────

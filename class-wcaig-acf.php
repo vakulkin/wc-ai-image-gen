@@ -26,6 +26,7 @@ class WCAIG_ACF {
 
 		// AJAX handlers.
 		add_action( 'wp_ajax_wcaig_run_worker', [ $this, 'ajax_run_worker' ] );
+		add_action( 'wp_ajax_wcaig_force_run_worker', [ $this, 'ajax_force_run_worker' ] );
 		add_action( 'wp_ajax_wcaig_run_gc', [ $this, 'ajax_run_gc' ] );
 		add_action( 'wp_ajax_wcaig_purge_all', [ $this, 'ajax_purge_all' ] );
 		add_action( 'wp_ajax_wcaig_regenerate', [ $this, 'ajax_regenerate' ] );
@@ -225,6 +226,12 @@ class WCAIG_ACF {
 		$this->verify_admin_ajax();
 		WCAIG_Worker::instance()->run();
 		wp_send_json_success( [ 'message' => 'Worker run completed.' ] );
+	}
+
+	public function ajax_force_run_worker(): void {
+		$this->verify_admin_ajax();
+		WCAIG_Worker::instance()->force_run();
+		wp_send_json_success( [ 'message' => 'Worker force run completed (lock cleared).' ] );
 	}
 
 	public function ajax_run_gc(): void {
