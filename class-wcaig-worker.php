@@ -303,8 +303,8 @@ class WCAIG_Worker
                 continue;
             }
 
-            $base_str   = ucfirst($base_term->name) . $this->format_term_meta($base_term, false);
-            $target_str = ucfirst($target_term->name) . $this->format_term_meta($target_term, true);
+            $base_str   = $this->format_term_meta($base_term, false);
+            $target_str = $this->format_term_meta($target_term, true);
 
             $replacement_lines[] = "Replace all {$base_str} elements with {$target_str}.";
 
@@ -351,13 +351,13 @@ class WCAIG_Worker
                 $ref_type  = get_field('wcaig_term_ref_type', $acf_id) ?: 'color';
                 $ref_filename = is_array($ref_image) ? $ref_image['filename'] : '';
                 $type_label = $ref_type === 'pattern' ? 'pattern/texture' : 'color';
-                return " (use the {$type_label} from the reference image \"{$ref_filename}\")";
+                return "the {$type_label} from the reference image \"{$ref_filename}\"";
             }
         }
 
         $source_description = get_field('wcaig_term_description', $acf_id) ?: '';
         if (! empty($source_description)) {
-            return " ({$source_description})";
+            return "{$source_description}";
         }
 
         return $term->name;
