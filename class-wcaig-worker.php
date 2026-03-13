@@ -306,7 +306,7 @@ class WCAIG_Worker
             $base_str   = ucfirst($base_term->name) . $this->format_term_meta($base_term, false);
             $target_str = ucfirst($target_term->name) . $this->format_term_meta($target_term, true);
 
-            $replacement_lines[] = "Replace all {$attr_name} {$base_str} with {$target_str}.";
+            $replacement_lines[] = "Replace all {$base_str} elements with {$target_str}.";
 
             // Collect reference image URL if present on the target term.
             $ref_url = $this->get_term_ref_image_url($target_term);
@@ -316,7 +316,7 @@ class WCAIG_Worker
         }
 
         $prompt  = "Strict color and material replacement.\n\n";
-        $prompt .= "Edit only the listed elements. Do not alter anything else.\n\n";
+        $prompt .= "Edit only the listed elements.\n\n";
         $prompt .= implode("\n", $replacement_lines) . "\n\n";
         $prompt .= "Preserve all perforation holes, cut-outs, and openings exactly as in the original — keep them open and show the original background through them.\n\n";
         $prompt .= "Preserve all shading, lighting, shadows, highlights, reflections, textures, and material realism.\n";
@@ -349,21 +349,18 @@ class WCAIG_Worker
             $ref_image = get_field('wcaig_term_ref_image', $acf_id);
             if (! empty($ref_image)) {
                 $ref_type  = get_field('wcaig_term_ref_type', $acf_id) ?: 'color';
-                $ref_title = is_array($ref_image) ? ($ref_image['title'] ?: $ref_image['filename']) : get_the_title($ref_image);
+                $ref_filename = is_array($ref_image) ? $ref_image['filename'] : '';
                 $type_label = $ref_type === 'pattern' ? 'pattern/texture' : 'color';
-
-                return " (use the {$type_label} from the reference image \"{$ref_title}\")";
+                return " (use the {$type_label} from the reference image \"{$ref_filename}\")";
             }
         }
 
-        // Plain color description (used for base term, or target term without ref image).
-        $parts = array_filter([
-            get_field('wcaig_term_color_hex', $acf_id) ?: '',
-            get_field('wcaig_term_color_rgb', $acf_id) ?: '',
-            get_field('wcaig_term_description', $acf_id) ?: '',
-        ]);
+        $source_description = get_field('wcaig_term_description', $acf_id) ?: '';
+        if (! empty($source_description)) {
+            return " ({$source_description})";
+        }
 
-        return ! empty($parts) ? ' (' . implode(', ', $parts) . ')' : '';
+        return $term->name;
     }
 
     /**
