@@ -143,6 +143,37 @@ class WCAIG_ACF {
 				[ 'key' => 'field_wcaig_term_color_hex', 'label' => 'Color HEX', 'name' => 'wcaig_term_color_hex', 'type' => 'color_picker' ],
 				[ 'key' => 'field_wcaig_term_color_rgb', 'label' => 'Color RGB', 'name' => 'wcaig_term_color_rgb', 'type' => 'text', 'instructions' => 'e.g., RGB 0, 184, 217' ],
 				[ 'key' => 'field_wcaig_term_description', 'label' => 'Description', 'name' => 'wcaig_term_description', 'type' => 'text', 'instructions' => 'e.g., bright turquoise cyan' ],
+				[
+					'key'           => 'field_wcaig_term_ref_image',
+					'label'         => 'Reference Image',
+					'name'          => 'wcaig_term_ref_image',
+					'type'          => 'image',
+					'return_format' => 'array',
+					'preview_size'  => 'thumbnail',
+					'instructions'  => 'Upload a swatch photo of the color or pattern. When set, the algorithm will derive the color/pattern from this image instead of HEX/RGB/description.',
+				],
+				[
+					'key'           => 'field_wcaig_term_ref_type',
+					'label'         => 'Reference Image Type',
+					'name'          => 'wcaig_term_ref_type',
+					'type'          => 'select',
+					'choices'       => [
+						'color'   => 'Color',
+						'pattern' => 'Pattern',
+					],
+					'default_value' => 'color',
+					'allow_null'    => 0,
+					'return_format' => 'value',
+					'conditional_logic' => [
+						[
+							[
+								'field'    => 'field_wcaig_term_ref_image',
+								'operator' => '!=empty',
+							],
+						],
+					],
+					'instructions'  => 'Is the reference image a solid color swatch or a repeating pattern/texture?',
+				],
 			],
 			'location' => $locations,
 		] );

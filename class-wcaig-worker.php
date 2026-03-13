@@ -239,9 +239,14 @@ class WCAIG_Worker
         }
 
         $target_attributes = json_decode($entry->attributes, true) ?: [];
-        $prompt = $this->build_prompt($product_id, $enabled, $target_attributes);
+        $prompt_data = $this->build_prompt($product_id, $enabled, $target_attributes);
 
-        $task_id = WCAIG_API_Client::instance()->create_task($prompt, $base_image_url, $hash);
+        $task_id = WCAIG_API_Client::instance()->create_task(
+            $prompt_data['prompt'],
+            $base_image_url,
+            $hash,
+            $prompt_data['ref_image_urls']
+        );
 
         if (is_wp_error($task_id)) {
             if ($task_id->get_error_code() === 'piapi_rate_limit') {
@@ -267,10 +272,14 @@ class WCAIG_Worker
     // Prompt building
     // ──────────────────────────────────────────────
 
-    private function build_prompt(int $product_id, array $enabled, array $target_attributes): string
+    /**
+     * Build the prompt and collect any reference image URLs from target terms.
+     *
+     * @return array{prompt: string, ref_image_urls: string[]}
+     */
+    private function build_prompt(int $product_id, array $enabled, array $target_attributes): array
     {
-        $prompt_parts = [];
-
+        $replacement_lines = [];
         foreach ($enabled as $attr_name) {
             $base_term   = get_field("wcaig_base_attr_{$attr_name}", $product_id);
             $target_slug = $target_attributes[$attr_name] ?? null;
@@ -284,30 +293,60 @@ class WCAIG_Worker
                 continue;
             }
 
-            $base_str   = ucfirst($base_term->name) . $this->format_term_meta($base_term);
-            $target_str = ucfirst($target_term->name) . $this->format_term_meta($target_term);
+            $base_str   = ucfirst($base_term->name) . $this->format_term_meta($base_term, false);
+            $target_str = ucfirst($target_term->name) . $this->format_term_meta($target_term, true);
 
-            $prompt_parts[] = "Replace all {$attr_name} {$base_str} with {$target_str}.";
+            $replacement_lines[] = "Replace all {$attr_name} {$base_str} with {$target_str}.";
+
+            // Collect reference image URL if present on the target term.
+            $ref_url = $this->get_term_ref_image_url($target_term);
+            if (! empty($ref_url)) {
+                $ref_image_urls[] = $ref_url;
+            }
         }
 
-        $prompt  = implode(' ', $prompt_parts);
-        $prompt .= ' Preserve the product shape, texture, lighting, shadows, reflections, and background.';
+        $prompt  = "Strict color and material replacement.\n\n";
+        $prompt .= "Edit only the listed elements. Do not alter anything else.\n\n";
+        $prompt .= implode("\n", $replacement_lines) . "\n\n";
+        $prompt .= "Preserve all perforation holes, cut-outs, and openings exactly as in the original — keep them open and show the original background through them.\n\n";
+        $prompt .= "Preserve all shading, lighting, shadows, highlights, reflections, textures, and material realism.\n";
+        $prompt .= "Preserve all shapes, proportions, composition, and image quality.";
 
         $custom_rules = WCAIG_Hash::get_option('wcaig_preservation_rules', '');
         if (! empty($custom_rules)) {
-            $prompt .= ' ' . trim($custom_rules);
+            $prompt .= "\n\n" . trim($custom_rules);
         }
 
-        return $prompt;
+        return [
+            'prompt'         => $prompt,
+            'ref_image_urls' => array_unique($ref_image_urls),
+        ];
     }
 
     /**
-     * Format term metadata as a parenthetical string (hex, rgb, description).
+     * Format term metadata as a parenthetical string.
+     *
+     * @param WP_Term $term      The attribute term.
+     * @param bool    $is_target True for the target term (includes ref-image instructions),
+     *                           false for the base term (only plain color description).
      */
-    private function format_term_meta(WP_Term $term): string
+    private function format_term_meta(WP_Term $term, bool $is_target = true): string
     {
         $acf_id = "{$term->taxonomy}_{$term->term_id}";
 
+        // Reference-image instructions only for the target term.
+        if ($is_target) {
+            $ref_image = get_field('wcaig_term_ref_image', $acf_id);
+            if (! empty($ref_image)) {
+                $ref_type  = get_field('wcaig_term_ref_type', $acf_id) ?: 'color';
+                $ref_title = is_array($ref_image) ? ($ref_image['title'] ?: $ref_image['filename']) : get_the_title($ref_image);
+                $type_label = $ref_type === 'pattern' ? 'pattern/texture' : 'color';
+
+                return " (use the {$type_label} from the reference image \"{$ref_title}\")";
+            }
+        }
+
+        // Plain color description (used for base term, or target term without ref image).
         $parts = array_filter([
             get_field('wcaig_term_color_hex', $acf_id) ?: '',
             get_field('wcaig_term_color_rgb', $acf_id) ?: '',
@@ -315,5 +354,22 @@ class WCAIG_Worker
         ]);
 
         return ! empty($parts) ? ' (' . implode(', ', $parts) . ')' : '';
+    }
+
+    /**
+     * Get the URL of a term's reference image (if any).
+     *
+     * Used by the API client to attach reference images to the request.
+     */
+    public function get_term_ref_image_url(WP_Term $term): string
+    {
+        $acf_id    = "{$term->taxonomy}_{$term->term_id}";
+        $ref_image = get_field('wcaig_term_ref_image', $acf_id);
+
+        if (empty($ref_image)) {
+            return '';
+        }
+
+        return is_array($ref_image) ? ($ref_image['url'] ?? '') : wp_get_attachment_url($ref_image);
     }
 }

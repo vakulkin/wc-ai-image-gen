@@ -35,12 +35,13 @@ class WCAIG_API_Client
     /**
      * Create a PIAPI task for image generation.
      *
-     * @param string $prompt    The constructed prompt.
-     * @param string $image_url The base image URL.
-     * @param string $hash      The variation hash.
+     * @param string   $prompt          The constructed prompt.
+     * @param string   $image_url       The base image URL.
+     * @param string   $hash            The variation hash.
+     * @param string[] $ref_image_urls  Optional reference images (e.g. color/pattern swatches).
      * @return string|WP_Error  Task ID on success, WP_Error on failure.
      */
-    public function create_task(string $prompt, string $image_url, string $hash): string|WP_Error
+    public function create_task(string $prompt, string $image_url, string $hash, array $ref_image_urls = []): string|WP_Error
     {
         $api_key     = $this->get_api_key();
         $webhook_url = $this->get_webhook_url();
@@ -48,12 +49,15 @@ class WCAIG_API_Client
         $task_type   = WCAIG_Hash::get_option('wcaig_task_type', 'gemini-2.5-flash-image');
         $secret      = WCAIG_Hash::get_option('wcaig_webhook_secret', '');
 
+        // Base image first, then any reference swatch/pattern images.
+        $all_image_urls = array_merge([$image_url], array_values($ref_image_urls));
+
         $payload = [
             'model'     => $model,
             'task_type' => $task_type,
             'input'     => [
                 'prompt'     => $prompt,
-                'image_urls' => [$image_url],
+                'image_urls' => $all_image_urls,
             ],
             'config'    => [
                 'webhook_config' => [
